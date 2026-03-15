@@ -19,7 +19,7 @@ The project consists of three crates (planned as a Cargo workspace):
 ## Hardware Environment
 
 - **Platform**: Raspberry Pi 5 (aarch64)
-- **UDC**: `dwc2` driver, device name `1000480000.usb`
+- **UDC**: `dwc2` driver, driver_name and device_name are both `1000480000.usb`
 - **Setup**: The USB OTG (Device) port is connected via cable back to one of the Pi's own USB Host ports, so gadgets created via raw-gadget are visible to the same machine (verifiable with `lsusb`).
 - **Raw-gadget device**: `/dev/raw-gadget`
 - **Reference source**: raw-gadget kernel module source is at `../raw-gadget`
