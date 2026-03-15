@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::io;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -9,41 +8,19 @@ use rawgadget::usb_types::{
     USB_DT_ENDPOINT, USB_REQ_GET_DESCRIPTOR, USB_REQ_SET_ADDRESS, USB_REQ_SET_CONFIGURATION,
 };
 use rawgadget::{Event, RawGadgetDevice, UsbEndpointDescriptor, UsbSpeed};
-use usbip::{import_device, list_devices, Direction};
+use usbip::{Direction, RetSubmit, UrbResponse, import_device, list_devices};
 
 // --- USB/IP Bridge ---
 
 struct UsbipBridge {
-    writer: Mutex<UsbipWriter>,
-    pending: Mutex<HashMap<u32, PendingRequest>>,
-}
-
-struct UsbipWriter {
-    stream: TcpStream,
-    devid: u32,
-    next_seqnum: u32,
-}
-
-struct PendingRequest {
-    direction: Direction,
-    tx: mpsc::SyncSender<io::Result<SubmitResponse>>,
-}
-
-struct SubmitResponse {
-    status: i32,
-    #[allow(dead_code)]
-    actual_length: u32,
-    data: Vec<u8>,
+    writer: Mutex<usbip::UsbipWriter>,
+    pending: Mutex<HashMap<u32, mpsc::SyncSender<io::Result<RetSubmit>>>>,
 }
 
 impl UsbipBridge {
-    fn new(write_stream: TcpStream, devid: u32) -> Self {
+    fn new(writer: usbip::UsbipWriter) -> Self {
         Self {
-            writer: Mutex::new(UsbipWriter {
-                stream: write_stream,
-                devid,
-                next_seqnum: 1,
-            }),
+            writer: Mutex::new(writer),
             pending: Mutex::new(HashMap::new()),
         }
     }
@@ -55,56 +32,25 @@ impl UsbipBridge {
         setup: [u8; 8],
         data: &[u8],
         transfer_buffer_length: u32,
-    ) -> io::Result<SubmitResponse> {
+    ) -> io::Result<RetSubmit> {
         let (tx, rx) = mpsc::sync_channel(1);
 
-        let seqnum = {
+        {
             let mut writer = self.writer.lock().unwrap();
-            let seqnum = writer.next_seqnum;
-            writer.next_seqnum += 1;
 
-            // Register pending BEFORE writing to avoid race with reader
-            {
-                let mut pending = self.pending.lock().unwrap();
-                pending.insert(seqnum, PendingRequest { direction, tx });
-            }
+            let seqnum = writer.send_submit(
+                ep,
+                direction,
+                0, // transfer_flags
+                transfer_buffer_length,
+                setup,
+                data,
+                0, // interval
+            )?;
 
-            // Write CMD_SUBMIT header (48 bytes)
-            let devid = writer.devid;
-            let s = &mut writer.stream;
+            self.pending.lock().unwrap().insert(seqnum, tx);
+        }
 
-            if let Err(e) = (|| -> io::Result<()> {
-                // usbip_header_basic (20 bytes)
-                s.write_all(&1u32.to_be_bytes())?; // USBIP_CMD_SUBMIT
-                s.write_all(&seqnum.to_be_bytes())?;
-                s.write_all(&devid.to_be_bytes())?;
-                s.write_all(&(direction as u32).to_be_bytes())?;
-                s.write_all(&ep.to_be_bytes())?;
-                // CMD_SUBMIT specific (28 bytes)
-                s.write_all(&0u32.to_be_bytes())?; // transfer_flags
-                s.write_all(&transfer_buffer_length.to_be_bytes())?;
-                s.write_all(&0u32.to_be_bytes())?; // start_frame
-                s.write_all(&0xffffffffu32.to_be_bytes())?; // number_of_packets (non-ISO)
-                s.write_all(&0u32.to_be_bytes())?; // interval
-                s.write_all(&setup)?;
-                // transfer_buffer for OUT
-                if direction == Direction::Out && !data.is_empty() {
-                    s.write_all(data)?;
-                }
-                s.flush()?;
-                Ok(())
-            })() {
-                // Clean up pending on write failure
-                let mut pending = self.pending.lock().unwrap();
-                pending.remove(&seqnum);
-                return Err(e);
-            }
-
-            seqnum
-        };
-        // writer lock released here
-
-        let _ = seqnum; // used only for registration
         rx.recv().unwrap_or_else(|_| {
             Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -113,59 +59,24 @@ impl UsbipBridge {
         })
     }
 
-    fn reader_thread(bridge: Arc<UsbipBridge>, mut stream: TcpStream) {
+    fn reader_thread(bridge: Arc<UsbipBridge>, mut reader: usbip::UsbipReader) {
         let result = (|| -> io::Result<()> {
             loop {
-                // Read 48-byte header
-                let mut header = [0u8; 48];
-                stream.read_exact(&mut header)?;
-
-                let command = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-                let seqnum = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
-
-                match command {
-                    3 => {
-                        // USBIP_RET_SUBMIT
-                        let status = i32::from_be_bytes([
-                            header[20], header[21], header[22], header[23],
-                        ]);
-                        let actual_length = u32::from_be_bytes([
-                            header[24], header[25], header[26], header[27],
-                        ]);
-
-                        let entry = {
+                match reader.recv()? {
+                    UrbResponse::Submit(ret) => {
+                        let tx = {
                             let mut pending = bridge.pending.lock().unwrap();
-                            pending.remove(&seqnum)
+                            pending.remove(&ret.seqnum)
                         };
 
-                        let Some(entry) = entry else {
-                            eprintln!("warning: RET_SUBMIT for unknown seqnum {seqnum}");
-                            continue;
-                        };
-
-                        let data = if entry.direction == Direction::In && actual_length > 0 {
-                            let mut buf = vec![0u8; actual_length as usize];
-                            stream.read_exact(&mut buf)?;
-                            buf
+                        if let Some(tx) = tx {
+                            let _ = tx.send(Ok(ret));
                         } else {
-                            Vec::new()
-                        };
-
-                        let _ = entry.tx.send(Ok(SubmitResponse {
-                            status,
-                            actual_length,
-                            data,
-                        }));
+                            eprintln!("warning: RET_SUBMIT for unknown seqnum {}", ret.seqnum);
+                        }
                     }
-                    4 => {
-                        // USBIP_RET_UNLINK - ignore for now
-                        eprintln!("warning: received RET_UNLINK seqnum={seqnum}");
-                    }
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("unknown URB response command: {command}"),
-                        ));
+                    UrbResponse::Unlink(ret) => {
+                        eprintln!("warning: received RET_UNLINK seqnum={}", ret.seqnum);
                     }
                 }
             }
@@ -177,8 +88,8 @@ impl UsbipBridge {
 
         // Drain all pending requests with error
         let mut pending = bridge.pending.lock().unwrap();
-        for (_, entry) in pending.drain() {
-            let _ = entry.tx.send(Err(io::Error::new(
+        for (_, tx) in pending.drain() {
+            let _ = tx.send(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "reader thread terminated",
             )));
@@ -339,22 +250,19 @@ fn main() -> io::Result<()> {
     // Step 2: Import the device
     eprintln!("Importing device {busid}...");
     let (dev_info, conn) = import_device(server_addr, &busid)?;
-    let devid = (dev_info.busnum << 16) | dev_info.devnum;
     eprintln!(
         "Imported: {:04x}:{:04x} speed={}",
         dev_info.id_vendor, dev_info.id_product, dev_info.speed
     );
 
-    // Step 3: Set up UsbipBridge with split TCP streams
-    let read_stream = conn.stream().try_clone()?;
-    let write_stream = conn.stream().try_clone()?;
-
-    let bridge = Arc::new(UsbipBridge::new(write_stream, devid));
+    // Step 3: Set up UsbipBridge with split connection
+    let (reader, writer) = conn.into_split()?;
+    let bridge = Arc::new(UsbipBridge::new(writer));
 
     // Spawn reader thread
     {
         let bridge = Arc::clone(&bridge);
-        thread::spawn(move || UsbipBridge::reader_thread(bridge, read_stream));
+        thread::spawn(move || UsbipBridge::reader_thread(bridge, reader));
     }
 
     // Step 4: Initialize raw-gadget
@@ -412,22 +320,15 @@ fn main() -> io::Result<()> {
                     handle_control_out_no_data(&gadget, &bridge, &ctrl)?;
                 }
             }
-            Event::Disconnect => {
-                eprintln!("event: Disconnect");
-                // EP threads will terminate on their own when ep_read/ep_write fails
+            Event::Disconnect | Event::Reset => {
+                eprintln!("event: {}", if matches!(event, Event::Disconnect) { "Disconnect" } else { "Reset" });
                 for h in ep_threads.drain(..) {
                     let _ = h.join();
                 }
                 cached_config_desc = None;
-                eprintln!("all EP threads joined after disconnect");
-            }
-            Event::Reset => {
-                eprintln!("event: Reset");
-                // EP threads will terminate on their own when ep_read/ep_write fails
-                for h in ep_threads.drain(..) {
-                    let _ = h.join();
+                if matches!(event, Event::Disconnect) {
+                    eprintln!("all EP threads joined after disconnect");
                 }
-                cached_config_desc = None;
             }
             Event::Suspend => {
                 eprintln!("event: Suspend");

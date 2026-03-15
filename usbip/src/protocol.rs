@@ -98,6 +98,12 @@ pub(crate) fn read_u32_be(r: &mut impl Read) -> io::Result<u32> {
     Ok(u32::from_be_bytes(buf))
 }
 
+pub(crate) fn read_i32_be(r: &mut impl Read) -> io::Result<i32> {
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    Ok(i32::from_be_bytes(buf))
+}
+
 pub(crate) fn read_exact_array<const N: usize>(r: &mut impl Read) -> io::Result<[u8; N]> {
     let mut buf = [0u8; N];
     r.read_exact(&mut buf)?;
