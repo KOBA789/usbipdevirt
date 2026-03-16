@@ -4,6 +4,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use log::{debug, error, info, warn};
 use rawgadget::usb_types::{
     USB_DT_ENDPOINT, USB_REQ_GET_DESCRIPTOR, USB_REQ_SET_ADDRESS, USB_REQ_SET_CONFIGURATION,
 };
@@ -72,18 +73,18 @@ impl UsbipBridge {
                         if let Some(tx) = tx {
                             let _ = tx.send(Ok(ret));
                         } else {
-                            eprintln!("warning: RET_SUBMIT for unknown seqnum {}", ret.seqnum);
+                            warn!("RET_SUBMIT for unknown seqnum {}", ret.seqnum);
                         }
                     }
                     UrbResponse::Unlink(ret) => {
-                        eprintln!("warning: received RET_UNLINK seqnum={}", ret.seqnum);
+                        warn!("received RET_UNLINK seqnum={}", ret.seqnum);
                     }
                 }
             }
         })();
 
         if let Err(e) = result {
-            eprintln!("reader thread error: {e}");
+            error!("reader thread error: {e}");
         }
 
         // Drain all pending requests with error
@@ -169,56 +170,56 @@ fn spawn_ep_threads(
             // IN endpoint: device→host
             // Read from USB/IP, write to raw-gadget
             let handle = thread::spawn(move || {
-                eprintln!("EP{ep_num} IN thread started");
+                debug!("EP{ep_num} IN thread started");
                 loop {
                     let resp =
                         match bridge.submit(ep_num, Direction::In, [0; 8], &[], max_packet_size) {
                             Ok(r) => r,
                             Err(e) => {
-                                eprintln!("EP{ep_num} IN submit error: {e}");
+                                error!("EP{ep_num} IN submit error: {e}");
                                 break;
                             }
                         };
                     if resp.status != 0 {
-                        eprintln!("EP{ep_num} IN submit status: {}", resp.status);
+                        warn!("EP{ep_num} IN submit status: {}", resp.status);
                         break;
                     }
                     if let Err(e) = gadget.ep_write(ep_handle, &resp.data) {
-                        eprintln!("EP{ep_num} IN ep_write error: {e}");
+                        error!("EP{ep_num} IN ep_write error: {e}");
                         break;
                     }
                 }
-                eprintln!("EP{ep_num} IN thread exiting");
+                debug!("EP{ep_num} IN thread exiting");
             });
             handles.push(handle);
         } else {
             // OUT endpoint: host→device
             // Read from raw-gadget, write to USB/IP
             let handle = thread::spawn(move || {
-                eprintln!("EP{ep_num} OUT thread started");
+                debug!("EP{ep_num} OUT thread started");
                 let mut buf = vec![0u8; max_packet_size as usize];
                 loop {
                     let n = match gadget.ep_read(ep_handle, &mut buf) {
                         Ok(n) => n,
                         Err(e) => {
-                            eprintln!("EP{ep_num} OUT ep_read error: {e}");
+                            error!("EP{ep_num} OUT ep_read error: {e}");
                             break;
                         }
                     };
                     match bridge.submit(ep_num, Direction::Out, [0; 8], &buf[..n], n as u32) {
                         Ok(resp) => {
                             if resp.status != 0 {
-                                eprintln!("EP{ep_num} OUT submit status: {}", resp.status);
+                                warn!("EP{ep_num} OUT submit status: {}", resp.status);
                                 break;
                             }
                         }
                         Err(e) => {
-                            eprintln!("EP{ep_num} OUT submit error: {e}");
+                            error!("EP{ep_num} OUT submit error: {e}");
                             break;
                         }
                     }
                 }
-                eprintln!("EP{ep_num} OUT thread exiting");
+                debug!("EP{ep_num} OUT thread exiting");
             });
             handles.push(handle);
         }
@@ -230,10 +231,12 @@ fn spawn_ep_threads(
 // --- Main ---
 
 fn main() -> io::Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     let server_addr = "localhost:3240";
 
     // Step 1: List devices and pick the first one
-    eprintln!("Listing devices on {server_addr}...");
+    info!("Listing devices on {server_addr}...");
     let devices = list_devices(server_addr)?;
     if devices.is_empty() {
         return Err(io::Error::new(
@@ -242,15 +245,15 @@ fn main() -> io::Result<()> {
         ));
     }
     let busid = devices[0].busid.clone();
-    eprintln!(
+    info!(
         "Found device: busid={busid} {:04x}:{:04x}",
         devices[0].id_vendor, devices[0].id_product
     );
 
     // Step 2: Import the device
-    eprintln!("Importing device {busid}...");
+    info!("Importing device {busid}...");
     let (dev_info, conn) = import_device(server_addr, &busid)?;
-    eprintln!(
+    info!(
         "Imported: {:04x}:{:04x} speed={}",
         dev_info.id_vendor, dev_info.id_product, dev_info.speed
     );
@@ -269,9 +272,9 @@ fn main() -> io::Result<()> {
     let gadget = Arc::new(RawGadgetDevice::open()?);
     let udc_name = "1000480000.usb";
     gadget.init(udc_name, udc_name, map_speed(dev_info.speed))?;
-    eprintln!("raw-gadget initialized (UDC: {udc_name})");
+    info!("raw-gadget initialized (UDC: {udc_name})");
     gadget.run()?;
-    eprintln!("raw-gadget running");
+    info!("raw-gadget running");
 
     // Step 5: Event loop
     let mut cached_config_desc: Option<Vec<u8>> = None;
@@ -281,7 +284,7 @@ fn main() -> io::Result<()> {
         let event = gadget.event_fetch()?;
         match event {
             Event::Connect => {
-                eprintln!("event: Connect");
+                info!("event: Connect");
             }
             Event::Control(ctrl) => {
                 let b_request_type = ctrl.bRequestType;
@@ -290,7 +293,7 @@ fn main() -> io::Result<()> {
                 let w_index = ctrl.wIndex;
                 let w_length = ctrl.wLength;
 
-                eprintln!(
+                debug!(
                     "event: Control bRequestType=0x{b_request_type:02x} bRequest=0x{b_request:02x} \
                      wValue=0x{w_value:04x} wIndex=0x{w_index:04x} wLength={w_length}"
                 );
@@ -321,23 +324,23 @@ fn main() -> io::Result<()> {
                 }
             }
             Event::Disconnect | Event::Reset => {
-                eprintln!("event: {}", if matches!(event, Event::Disconnect) { "Disconnect" } else { "Reset" });
+                info!("event: {}", if matches!(event, Event::Disconnect) { "Disconnect" } else { "Reset" });
                 for h in ep_threads.drain(..) {
                     let _ = h.join();
                 }
                 cached_config_desc = None;
                 if matches!(event, Event::Disconnect) {
-                    eprintln!("all EP threads joined after disconnect");
+                    debug!("all EP threads joined after disconnect");
                 }
             }
             Event::Suspend => {
-                eprintln!("event: Suspend");
+                info!("event: Suspend");
             }
             Event::Resume => {
-                eprintln!("event: Resume");
+                info!("event: Resume");
             }
             Event::Unknown(ty) => {
-                eprintln!("event: Unknown({ty})");
+                warn!("event: Unknown({ty})");
             }
         }
     }
@@ -367,11 +370,11 @@ fn handle_control_in(
         // Cache configuration descriptor
         if ctrl.bRequest == USB_REQ_GET_DESCRIPTOR && (ctrl.wValue >> 8) == 0x02 {
             *cached_config_desc = Some(resp.data.clone());
-            eprintln!("cached config descriptor ({} bytes)", resp.data.len());
+            debug!("cached config descriptor ({} bytes)", resp.data.len());
         }
         gadget.ep0_write(&resp.data)?;
     } else {
-        eprintln!("control IN stall (status={})", resp.status);
+        warn!("control IN stall (status={})", resp.status);
         gadget.ep0_stall()?;
     }
     Ok(())
@@ -394,7 +397,7 @@ fn handle_control_out_with_data(
     // so we can't stall retroactively. Just forward and log errors.
     let resp = bridge.submit(0, Direction::Out, setup, data, w_length as u32)?;
     if resp.status != 0 {
-        eprintln!("control OUT (with data) remote status: {}", resp.status);
+        warn!("control OUT (with data) remote status: {}", resp.status);
     }
     Ok(())
 }
@@ -410,7 +413,7 @@ fn handle_control_out_no_data(
     if resp.status == 0 {
         gadget.ep0_read(&mut [])?;
     } else {
-        eprintln!("control OUT (no data) stall (status={})", resp.status);
+        warn!("control OUT (no data) stall (status={})", resp.status);
         gadget.ep0_stall()?;
     }
     Ok(())
@@ -428,7 +431,7 @@ fn handle_set_configuration(
     // Forward SET_CONFIGURATION to USB/IP
     let resp = bridge.submit(0, Direction::Out, setup, &[], 0)?;
     if resp.status != 0 {
-        eprintln!("SET_CONFIGURATION failed on USB/IP side (status={})", resp.status);
+        warn!("SET_CONFIGURATION failed on USB/IP side (status={})", resp.status);
         gadget.ep0_stall()?;
         return Ok(());
     }
@@ -442,15 +445,15 @@ fn handle_set_configuration(
     })?;
 
     let ep_descs = parse_endpoint_descriptors(config_data);
-    eprintln!("SET_CONFIGURATION: found {} endpoints", ep_descs.len());
+    info!("SET_CONFIGURATION: found {} endpoints", ep_descs.len());
 
     // Enable endpoints
     let mut ep_handles = Vec::new();
     for desc in &ep_descs {
         let ep_addr = desc.bEndpointAddress;
         let handle = gadget.ep_enable(desc)?;
-        eprintln!(
-            "  enabled EP 0x{ep_addr:02x} ({})",
+        debug!(
+            "enabled EP 0x{ep_addr:02x} ({})",
             if ep_addr & 0x80 != 0 { "IN" } else { "OUT" }
         );
         ep_handles.push(handle);
@@ -460,12 +463,12 @@ fn handle_set_configuration(
     if config_data.len() > 7 {
         let max_power = config_data[7] as u32;
         gadget.vbus_draw(max_power)?;
-        eprintln!("  vbus_draw({max_power})");
+        debug!("vbus_draw({max_power})");
     }
 
     // Mark as configured
     gadget.configure()?;
-    eprintln!("  gadget configured");
+    info!("gadget configured");
 
     // ACK the SET_CONFIGURATION before spawning EP threads
     gadget.ep0_read(&mut [])?;
