@@ -4,12 +4,29 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use clap::Parser;
 use log::{debug, error, info, warn};
 use rawgadget::usb_types::{
     USB_DT_ENDPOINT, USB_REQ_GET_DESCRIPTOR, USB_REQ_SET_ADDRESS, USB_REQ_SET_CONFIGURATION,
 };
 use rawgadget::{Event, RawGadgetDevice, UsbEndpointDescriptor, UsbSpeed};
 use usbip::{Direction, RetSubmit, UrbResponse, import_device, list_devices};
+
+#[derive(Parser)]
+#[command(about = "Bridge USB/IP devices to raw-gadget")]
+struct Args {
+    /// USB/IP server host
+    #[arg(long, default_value = "localhost")]
+    host: String,
+
+    /// USB/IP server port
+    #[arg(long, default_value_t = 3240)]
+    port: u16,
+
+    /// UDC driver/device name
+    #[arg(long, default_value = "1000480000.usb")]
+    udc: String,
+}
 
 // --- USB/IP Bridge ---
 
@@ -233,11 +250,12 @@ fn spawn_ep_threads(
 fn main() -> io::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let server_addr = "localhost:3240";
+    let args = Args::parse();
+    let server_addr = format!("{}:{}", args.host, args.port);
 
     // Step 1: List devices and pick the first one
     info!("Listing devices on {server_addr}...");
-    let devices = list_devices(server_addr)?;
+    let devices = list_devices(&server_addr)?;
     if devices.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -252,7 +270,7 @@ fn main() -> io::Result<()> {
 
     // Step 2: Import the device
     info!("Importing device {busid}...");
-    let (dev_info, conn) = import_device(server_addr, &busid)?;
+    let (dev_info, conn) = import_device(&server_addr, &busid)?;
     info!(
         "Imported: {:04x}:{:04x} speed={}",
         dev_info.id_vendor, dev_info.id_product, dev_info.speed
@@ -270,7 +288,7 @@ fn main() -> io::Result<()> {
 
     // Step 4: Initialize raw-gadget
     let gadget = Arc::new(RawGadgetDevice::open()?);
-    let udc_name = "1000480000.usb";
+    let udc_name = &args.udc;
     gadget.init(udc_name, udc_name, map_speed(dev_info.speed))?;
     info!("raw-gadget initialized (UDC: {udc_name})");
     gadget.run()?;
