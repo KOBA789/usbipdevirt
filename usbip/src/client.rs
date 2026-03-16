@@ -3,23 +3,30 @@ use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 
+use zerocopy::byteorder::network_endian::{U16, U32};
+use zerocopy::{FromBytes, IntoBytes};
+
 use crate::protocol::*;
+use crate::wire::*;
 
 /// Lists USB devices exported by the USB/IP server at `addr`.
 pub fn list_devices(addr: impl ToSocketAddrs) -> io::Result<Vec<DeviceInfo>> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true)?;
 
-    // Send OP_REQ_DEVLIST (8 bytes)
-    write_u16_be(&mut stream, USBIP_VERSION)?;
-    write_u16_be(&mut stream, OP_REQ_DEVLIST)?;
-    write_u32_be(&mut stream, 0)?;
+    // Send OP_REQ_DEVLIST
+    let header = OpHeader {
+        version: U16::new(USBIP_VERSION),
+        code: U16::new(OP_REQ_DEVLIST),
+        status: U32::new(0),
+    };
+    stream.write_all(header.as_bytes())?;
     stream.flush()?;
 
-    // Read OP_REP_DEVLIST header (12 bytes)
-    let _version = read_u16_be(&mut stream)?;
-    let code = read_u16_be(&mut stream)?;
-    let status = read_u32_be(&mut stream)?;
+    // Read OP_REP_DEVLIST header
+    let rep: OpRepDevlistHeader = read_wire(&mut stream)?;
+    let code = rep.header.code.get();
+    let status = rep.header.status.get();
 
     if code != OP_REP_DEVLIST {
         return Err(io::Error::new(
@@ -34,14 +41,16 @@ pub fn list_devices(addr: impl ToSocketAddrs) -> io::Result<Vec<DeviceInfo>> {
         ));
     }
 
-    let num_devices = read_u32_be(&mut stream)?;
+    let num_devices = rep.num_devices.get();
     let mut devices = Vec::with_capacity(num_devices as usize);
 
     for _ in 0..num_devices {
-        let mut dev = read_device_info(&mut stream)?;
-        let num_ifaces = dev.num_interfaces;
+        let wire_dev: WireDeviceInfo = read_wire(&mut stream)?;
+        let num_ifaces = wire_dev.num_interfaces;
+        let mut dev = DeviceInfo::from(&wire_dev);
         for _ in 0..num_ifaces {
-            dev.interfaces.push(read_interface_info(&mut stream)?);
+            let wire_iface: WireInterfaceInfo = read_wire(&mut stream)?;
+            dev.interfaces.push(InterfaceInfo::from(&wire_iface));
         }
         devices.push(dev);
     }
@@ -59,22 +68,25 @@ pub fn import_device(
     let mut stream = TcpStream::connect(addr)?;
     stream.set_nodelay(true)?;
 
-    // Send OP_REQ_IMPORT (40 bytes: 8 header + 32 busid)
-    write_u16_be(&mut stream, USBIP_VERSION)?;
-    write_u16_be(&mut stream, OP_REQ_IMPORT)?;
-    write_u32_be(&mut stream, 0)?;
-
-    let mut busid_buf = [0u8; BUSID_LEN];
+    // Send OP_REQ_IMPORT
+    let mut req = OpReqImport {
+        header: OpHeader {
+            version: U16::new(USBIP_VERSION),
+            code: U16::new(OP_REQ_IMPORT),
+            status: U32::new(0),
+        },
+        busid: [0u8; BUSID_LEN],
+    };
     let busid_bytes = busid.as_bytes();
     let copy_len = busid_bytes.len().min(BUSID_LEN - 1);
-    busid_buf[..copy_len].copy_from_slice(&busid_bytes[..copy_len]);
-    stream.write_all(&busid_buf)?;
+    req.busid[..copy_len].copy_from_slice(&busid_bytes[..copy_len]);
+    stream.write_all(req.as_bytes())?;
     stream.flush()?;
 
-    // Read OP_REP_IMPORT header (8 bytes)
-    let _version = read_u16_be(&mut stream)?;
-    let code = read_u16_be(&mut stream)?;
-    let status = read_u32_be(&mut stream)?;
+    // Read OP_REP_IMPORT header
+    let rep: OpHeader = read_wire(&mut stream)?;
+    let code = rep.code.get();
+    let status = rep.status.get();
 
     if code != OP_REP_IMPORT {
         return Err(io::Error::new(
@@ -89,8 +101,9 @@ pub fn import_device(
         ));
     }
 
-    // Read device info (312 bytes, no interfaces in import reply)
-    let dev = read_device_info(&mut stream)?;
+    // Read device info
+    let wire_dev: WireDeviceInfo = read_wire(&mut stream)?;
+    let dev = DeviceInfo::from(&wire_dev);
     let devid = (dev.busnum << 16) | dev.devnum;
 
     let conn = UsbipConnection {
@@ -301,17 +314,18 @@ pub struct UsbipReader {
 impl UsbipReader {
     /// Receives the next URB response from the server.
     pub fn recv(&mut self) -> io::Result<UrbResponse> {
-        let command = read_u32_be(&mut self.stream)?;
-        let seqnum = read_u32_be(&mut self.stream)?;
-        // devid (4) + direction (4) + ep (4)
-        let _: [u8; 12] = read_exact_array(&mut self.stream)?;
+        let mut buf = [0u8; 48];
+        self.stream.read_exact(&mut buf)?;
+
+        let command = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
 
         match command {
             USBIP_RET_SUBMIT => {
-                let status = read_i32_be(&mut self.stream)?;
-                let actual_length = read_u32_be(&mut self.stream)?;
-                // start_frame (4) + number_of_packets (4) + error_count (4) + setup (8)
-                let _: [u8; 20] = read_exact_array(&mut self.stream)?;
+                let header = RetSubmitHeader::ref_from_bytes(&buf)
+                    .expect("buf is exactly 48 bytes with alignment 1");
+                let seqnum = header.seqnum.get();
+                let status = header.status.get();
+                let actual_length = header.actual_length.get();
 
                 let direction = {
                     let mut shared = self.shared.lock().unwrap();
@@ -341,9 +355,10 @@ impl UsbipReader {
                 }))
             }
             USBIP_RET_UNLINK => {
-                let status = read_i32_be(&mut self.stream)?;
-                // padding (24)
-                let _: [u8; 24] = read_exact_array(&mut self.stream)?;
+                let header = RetUnlinkHeader::ref_from_bytes(&buf)
+                    .expect("buf is exactly 48 bytes with alignment 1");
+                let seqnum = header.seqnum.get();
+                let status = header.status.get();
 
                 {
                     let mut shared = self.shared.lock().unwrap();
@@ -356,14 +371,10 @@ impl UsbipReader {
 
                 Ok(UrbResponse::Unlink(RetUnlink { seqnum, status }))
             }
-            _ => {
-                // Drain remaining 28 bytes of the header
-                let _: [u8; 28] = read_exact_array(&mut self.stream)?;
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unknown URB response command: {command}"),
-                ))
-            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown URB response command: {command}"),
+            )),
         }
     }
 }
@@ -382,20 +393,20 @@ fn write_cmd_submit(
     data: &[u8],
     interval: u32,
 ) -> io::Result<()> {
-    // usbip_header_basic (20 bytes)
-    write_u32_be(w, USBIP_CMD_SUBMIT)?;
-    write_u32_be(w, seqnum)?;
-    write_u32_be(w, devid)?;
-    write_u32_be(w, direction as u32)?;
-    write_u32_be(w, ep)?;
-
-    // CMD_SUBMIT specific (28 bytes)
-    write_u32_be(w, transfer_flags)?;
-    write_u32_be(w, transfer_buffer_length)?;
-    write_u32_be(w, 0)?; // start_frame
-    write_u32_be(w, 0xffffffff)?; // number_of_packets (non-ISO)
-    write_u32_be(w, interval)?;
-    w.write_all(&setup)?;
+    let header = CmdSubmitHeader {
+        command: U32::new(USBIP_CMD_SUBMIT),
+        seqnum: U32::new(seqnum),
+        devid: U32::new(devid),
+        direction: U32::new(direction as u32),
+        ep: U32::new(ep),
+        transfer_flags: U32::new(transfer_flags),
+        transfer_buffer_length: U32::new(transfer_buffer_length),
+        start_frame: U32::new(0),
+        number_of_packets: U32::new(0xffffffff),
+        interval: U32::new(interval),
+        setup,
+    };
+    w.write_all(header.as_bytes())?;
 
     // transfer_buffer for OUT direction
     if direction == Direction::Out && !data.is_empty() {
@@ -412,16 +423,16 @@ fn write_cmd_unlink(
     devid: u32,
     unlink_seqnum: u32,
 ) -> io::Result<()> {
-    // usbip_header_basic (20 bytes)
-    write_u32_be(w, USBIP_CMD_UNLINK)?;
-    write_u32_be(w, seqnum)?;
-    write_u32_be(w, devid)?;
-    write_u32_be(w, 0)?; // direction
-    write_u32_be(w, 0)?; // ep
-
-    // CMD_UNLINK specific (28 bytes)
-    write_u32_be(w, unlink_seqnum)?;
-    w.write_all(&[0u8; 24])?; // padding
+    let header = CmdUnlinkHeader {
+        command: U32::new(USBIP_CMD_UNLINK),
+        seqnum: U32::new(seqnum),
+        devid: U32::new(devid),
+        direction: U32::new(0),
+        ep: U32::new(0),
+        unlink_seqnum: U32::new(unlink_seqnum),
+        _padding: [0u8; 24],
+    };
+    w.write_all(header.as_bytes())?;
 
     w.flush()?;
     Ok(())
@@ -432,17 +443,18 @@ fn recv_urb_response(
     pending: &mut HashMap<u32, Direction>,
     unlinks: &mut HashMap<u32, u32>,
 ) -> io::Result<UrbResponse> {
-    // Read the full 48-byte header
-    let header: [u8; 48] = read_exact_array(r)?;
+    let mut buf = [0u8; 48];
+    r.read_exact(&mut buf)?;
 
-    let command = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-    let seqnum = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+    let command = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
 
     match command {
         USBIP_RET_SUBMIT => {
-            let status = i32::from_be_bytes([header[20], header[21], header[22], header[23]]);
-            let actual_length =
-                u32::from_be_bytes([header[24], header[25], header[26], header[27]]);
+            let header = RetSubmitHeader::ref_from_bytes(&buf)
+                .expect("buf is exactly 48 bytes with alignment 1");
+            let seqnum = header.seqnum.get();
+            let status = header.status.get();
+            let actual_length = header.actual_length.get();
 
             let direction = pending.remove(&seqnum).ok_or_else(|| {
                 io::Error::new(
@@ -468,7 +480,10 @@ fn recv_urb_response(
             }))
         }
         USBIP_RET_UNLINK => {
-            let status = i32::from_be_bytes([header[20], header[21], header[22], header[23]]);
+            let header = RetUnlinkHeader::ref_from_bytes(&buf)
+                .expect("buf is exactly 48 bytes with alignment 1");
+            let seqnum = header.seqnum.get();
+            let status = header.status.get();
 
             if let Some(target_seqnum) = unlinks.remove(&seqnum) {
                 if status == -ECONNRESET {
