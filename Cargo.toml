@@ -1,3 +1,3 @@
 [workspace]
-members = ["rawgadget", "usbip", "usbipreifier"]
+members = ["rawgadget", "usbip", "usbipdevirt"]
 resolver = "3"

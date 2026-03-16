@@ -1,8 +1,8 @@
-# usbipreifier
+# usbipdevirt
 
 ## Project Overview
 
-usbipreifier is a tool that materializes remote USB devices exposed via USB/IP as physical USB devices using Linux's raw-gadget interface. It acts as a bridge: it connects to a USB/IP server as a client, imports a remote USB device, and then re-creates that device locally using raw-gadget so it appears as a real physical USB device.
+usbipdevirt is a tool that materializes remote USB devices exposed via USB/IP as physical USB devices using Linux's raw-gadget interface. It acts as a bridge: it connects to a USB/IP server as a client, imports a remote USB device, and then re-creates that device locally using raw-gadget so it appears as a real physical USB device.
 
 Think of it as the reverse of typical USB/IP usage — instead of making a local device available remotely, it makes a remote device available locally as if it were physically plugged in.
 
@@ -14,7 +14,7 @@ The project consists of three crates in a Cargo workspace (resolver = "3"):
 
 2. **usbip** — USB/IP protocol client library. Implements the wire protocol (device listing, device import, URB submission/completion) over TCP.
 
-3. **usbipreifier** — The main application binary that connects the above two crates. It imports a USB device via USB/IP and re-emits it as a physical gadget via raw-gadget.
+3. **usbipdevirt** — The main application binary that connects the above two crates. It imports a USB device via USB/IP and re-emits it as a physical gadget via raw-gadget.
 
 ## Hardware Environment
 
