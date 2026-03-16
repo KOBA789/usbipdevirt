@@ -23,9 +23,13 @@ struct Args {
     #[arg(long, default_value_t = 3240)]
     port: u16,
 
-    /// UDC driver/device name
+    /// UDC driver name (see /sys/class/udc/*/uevent for USB_UDC_NAME)
     #[arg(long, default_value = "1000480000.usb")]
-    udc: String,
+    udc_driver: String,
+
+    /// UDC device name (see /sys/class/udc/)
+    #[arg(long, default_value = "1000480000.usb")]
+    udc_device: String,
 }
 
 // --- USB/IP Bridge ---
@@ -288,9 +292,11 @@ fn main() -> io::Result<()> {
 
     // Step 4: Initialize raw-gadget
     let gadget = Arc::new(RawGadgetDevice::open()?);
-    let udc_name = &args.udc;
-    gadget.init(udc_name, udc_name, map_speed(dev_info.speed))?;
-    info!("raw-gadget initialized (UDC: {udc_name})");
+    gadget.init(&args.udc_driver, &args.udc_device, map_speed(dev_info.speed))?;
+    info!(
+        "raw-gadget initialized (UDC driver: {}, device: {})",
+        args.udc_driver, args.udc_device
+    );
     gadget.run()?;
     info!("raw-gadget running");
 

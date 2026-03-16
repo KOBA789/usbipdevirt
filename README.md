@@ -13,14 +13,15 @@ Typical USB/IP makes local devices available remotely. This tool does the revers
 ## Usage
 
 ```
-usbipdevirt [--host <HOST>] [--port <PORT>] [--udc <UDC>]
+usbipdevirt [--host <HOST>] [--port <PORT>] [--udc-driver <DRIVER>] [--udc-device <DEVICE>]
 ```
 
-| Option   | Default            | Description              |
-|----------|--------------------|--------------------------|
-| `--host` | `localhost`        | USB/IP server host       |
-| `--port` | `3240`             | USB/IP server port       |
-| `--udc`  | `1000480000.usb`   | UDC driver/device name   |
+| Option         | Default            | Description        |
+|----------------|--------------------|--------------------|
+| `--host`       | `localhost`        | USB/IP server host |
+| `--port`       | `3240`             | USB/IP server port |
+| `--udc-driver` | `1000480000.usb`   | UDC driver name    |
+| `--udc-device` | `1000480000.usb`   | UDC device name    |
 
 Root or appropriate device permissions required.
 
