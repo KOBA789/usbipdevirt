@@ -8,7 +8,7 @@ Think of it as the reverse of typical USB/IP usage — instead of making a local
 
 ## Architecture
 
-The project consists of three crates (planned as a Cargo workspace):
+The project consists of three crates in a Cargo workspace (resolver = "3"):
 
 1. **rawgadget** — Safe Rust wrapper around the Linux raw-gadget kernel interface (`/dev/raw-gadget`). Handles ioctl calls, event fetching, endpoint management, and data transfers.
 
@@ -58,5 +58,6 @@ Interacting with `/dev/raw-gadget` requires root or appropriate device permissio
 
 - Rust edition: 2024
 - Minimum Rust version: 1.92.0
-- Async runtime: TBD (tokio is a likely choice)
-- Error handling: TBD (anyhow or thiserror)
+- Async runtime: None. Synchronous blocking I/O with `std::thread` and `std::sync::mpsc`
+- Error handling: `std::io::Result<T>` (stdlib only, no anyhow/thiserror)
+- Wire format: `zerocopy` crate with `#[repr(C)]` structs for zero-copy big-endian ser/des
